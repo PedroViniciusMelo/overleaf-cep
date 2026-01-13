@@ -1,0 +1,83 @@
+# ==============================================================================
+# ESTÁGIO 1: Downloader & Extractor (Roda nativo no seu PC Windows/AMD64)
+# ==============================================================================
+# O flag --platform=$BUILDPLATFORM força essa etapa a rodar na CPU do host
+# (rápido e sem erros de emulação), mesmo que o build final seja para ARM64.
+FROM --platform=$BUILDPLATFORM alpine:latest AS downloader
+
+RUN apk add --no-cache aria2 7zip wget coreutils
+
+WORKDIR /download
+ARG TEXLIVE_MIRROR=https://mirror.ctan.org/systems/texlive/Images
+
+# 1. Baixa a ISO e o arquivo de verificação (SHA512)
+RUN wget ${TEXLIVE_MIRROR}/texlive2025.iso.sha512 \
+ && aria2c -x 16 -s 16 -o texlive2025.iso ${TEXLIVE_MIRROR}/texlive2025.iso
+
+# 2. VERIFICAÇÃO DE INTEGRIDADE (Crucial para evitar o erro de checksum)
+RUN sha512sum -c texlive2025.iso.sha512
+
+# 3. Extrai para uma pasta limpa
+RUN mkdir /texlive_extracted \
+ && 7zz x texlive2025.iso -o/texlive_extracted \
+ && rm texlive2025.iso
+
+
+# ==============================================================================
+# ESTÁGIO 2: Imagem Final (ShareLaTeX Base - ARM64 para Raspberry Pi)
+# ==============================================================================
+FROM phusion/baseimage:noble-1.0.2
+
+ENV TEXMFVAR=/var/lib/overleaf/tmp/texmf-var
+ENV REBUILT_AFTER="2026-01-13"
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instalar dependências do SO
+# ---------------------------
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked true \
+ && rm -f /etc/apt/apt.conf.d/docker-clean && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache \
+ && echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true | debconf-set-selections \
+ && apt-get update \
+ && apt-get install -y \
+      unattended-upgrades \
+      build-essential wget net-tools unzip time imagemagick optipng strace nginx git python3 python-is-python3 zlib1g-dev libpcre3-dev gettext-base libwww-perl ca-certificates curl gnupg \
+      qpdf locales \
+      inkscape python3-pygments python3-pip gnuplot graphviz \
+      p7zip-full \
+      fontconfig cabextract xfonts-utils ttf-mscorefonts-installer \
+ && locale-gen en_US.UTF-8 pt_BR.UTF-8 \
+ && unattended-upgrade --verbose --no-minimal-upgrade-steps \
+ && mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+ && apt-get update \
+ && apt-get install -y nodejs \
+ && rm -rf /etc/nginx/nginx.conf /etc/nginx/sites-enabled/default \
+ && fc-cache -f -v
+
+# Instalar TexLive (Copia os arquivos checados do Estágio 1)
+# ----------------------------------------------------------
+COPY --from=downloader /texlive_extracted /tmp/texlive
+
+RUN cd /tmp/texlive \
+ && echo "selected_scheme scheme-full" > texlive.profile \
+ && echo "tlpdbopt_autobackup 0" >> texlive.profile \
+ && echo "tlpdbopt_install_docfiles 0" >> texlive.profile \
+ && echo "tlpdbopt_install_srcfiles 0" >> texlive.profile \
+ # Executa com Perl explicitamente para evitar erro de permissão (exit 126)
+ && perl ./install-tl -profile texlive.profile -repository . \
+ && cd / \
+ && rm -rf /tmp/texlive \
+ && $(find /usr/local/texlive -name tlmgr) path add \
+ && tlmgr path add
+
+# Setup do usuário Overleaf
+# -------------------------
+RUN adduser --system --group --home /overleaf --no-create-home overleaf && \
+    mkdir -p /var/lib/overleaf && \
+    chown www-data:www-data /var/lib/overleaf && \
+    mkdir -p /var/log/overleaf && \
+    chown www-data:www-data /var/log/overleaf && \
+    mkdir -p /var/lib/overleaf/data/template_files && \
+    chown www-data:www-data /var/lib/overleaf/data/template_files
